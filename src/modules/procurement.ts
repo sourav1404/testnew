@@ -103,6 +103,20 @@ export interface ReceiptLineInput {
 }
 
 /**
+ * What to do when a line would exceed its ordered quantity and the caller is
+ * not authorised to accept it.
+ *
+ * `reject_batch` (the default) keeps the original all-or-nothing behaviour: a
+ * lorry that arrived wrong is one event, and a warehouse clerk usually wants to
+ * stop and look at it rather than half-book it.
+ *
+ * `reject_line` books the good lines and reports the bad ones. That is the
+ * right shape for a multi-supplier consolidated delivery, where one wrong line
+ * should not hold up nine correct ones.
+ */
+export type OverReceiptPolicy = "reject_batch" | "reject_line";
+
+/**
  * Requirement 4. Over-receipt is decided here, in application code, under an
  * explicit row lock -- not left to the trigger, which stays as the backstop.
  *
@@ -110,9 +124,15 @@ export interface ReceiptLineInput {
  * sum of receipts (po_line_status), so receiving 40 of 100 leaves 60
  * outstanding without any counter to keep in step.
  */
+interface PoLineRow {
+  id: string; product_id: string; warehouse_id: string;
+  ordered_qty: string; unit_price: string; received: string;
+}
+
 export async function receiveGoods(
   tx: Tx,
-  input: { poId: number; lines: ReceiptLineInput[]; actorId: number; mayOverReceive: boolean },
+  input: { poId: number; lines: ReceiptLineInput[]; actorId: number; mayOverReceive: boolean;
+           onOverReceipt?: OverReceiptPolicy },
 ) {
   const po = await tx.query<{ status: string }>(
     `SELECT status FROM purchase_orders WHERE id = $1`, [input.poId]);
@@ -143,26 +163,50 @@ export async function receiveGoods(
   }
   const byId = new Map(locked.rows.map((r) => [Number(r.id), r]));
 
-  // Decide over-receipt for every line before writing anything, so the response
-  // is one verdict for the whole receipt rather than a half-applied batch.
-  const planned = input.lines.map((line) => {
+  // Classify every line before writing anything. Two policies share one pass:
+  // reject_batch throws on the first offender (unchanged default), reject_line
+  // records the refusal and carries on with the rest.
+  const policy: OverReceiptPolicy = input.onOverReceipt ?? "reject_batch";
+  const accepted: Array<{ line: ReceiptLineInput; po_line: PoLineRow; isOver: boolean }> = [];
+  const refused: Array<{ po_line_id: number; reason: string; ordered: string;
+                         already_received: string; attempted: string }> = [];
+
+  for (const line of input.lines) {
     const po_line = byId.get(line.poLineId)!;
     const after = money.add(po_line.received, line.receivedQty, 4, "received_qty");
     const isOver = money.cmp(after, po_line.ordered_qty) > 0;
-    if (isOver && !(line.allowOverReceipt && input.mayOverReceive)) {
-      throw new ApiError(422, "over_receipt",
-        `over-receipt on PO line ${line.poLineId}`, {
-          po_line_id: line.poLineId,
-          ordered: po_line.ordered_qty,
-          already_received: po_line.received,
-          attempted: line.receivedQty,
-          hint: line.allowOverReceipt
-            ? "requires the receipt.over_receive permission"
-            : "resubmit with allow_over_receipt to accept it as an over-receipt",
-        });
+    const authorised = Boolean(line.allowOverReceipt) && input.mayOverReceive;
+
+    if (isOver && !authorised) {
+      const detail = {
+        po_line_id: line.poLineId,
+        ordered: po_line.ordered_qty,
+        already_received: po_line.received,
+        attempted: line.receivedQty,
+        reason: line.allowOverReceipt
+          ? "requires the receipt.over_receive permission"
+          : "resubmit with allow_over_receipt to accept it as an over-receipt",
+      };
+      if (policy === "reject_batch") {
+        throw new ApiError(422, "over_receipt",
+          `over-receipt on PO line ${line.poLineId}`,
+          { ...detail, hint: detail.reason });
+      }
+      refused.push(detail);
+      continue;
     }
-    return { line, po_line, isOver };
-  });
+    accepted.push({ line, po_line, isOver });
+  }
+
+  // A receipt that books nothing is not a receipt. Refusing here rather than
+  // writing an empty goods_receipts row keeps the retry semantics simple: the
+  // transaction rolls back, the Idempotency-Key is released, and the caller can
+  // resubmit a corrected batch.
+  if (accepted.length === 0) {
+    throw new ApiError(422, "over_receipt",
+      "every line on this receipt was refused", { refused });
+  }
+  const planned = accepted;
 
   const receipt = await tx.query<{ id: string }>(
     `INSERT INTO goods_receipts (po_id, received_by) VALUES ($1, $2) RETURNING id`,
@@ -227,7 +271,12 @@ export async function receiveGoods(
   return {
     goods_receipt_id: receiptId,
     ledger_entry_id: entryId,
+    // Only the accepted lines are in gross_value, and postEntry built the
+    // entry from the same list, so the entry balances over exactly what was
+    // booked -- a refused line contributes no movement and no ledger line.
     gross_value: grossValue,
     lines: out,
+    refused,
+    policy,
   };
 }

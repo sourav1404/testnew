@@ -101,6 +101,7 @@ export function createApp() {
         // Asking for it is not the same as being allowed to: the permission is
         // checked here, server-side, not inferred from the request body.
         mayOverReceive: actor.permissions.has("receipt.over_receive"),
+        onOverReceipt: b.on_over_receipt === "reject_line" ? "reject_line" : "reject_batch",
       }));
     }));
 
