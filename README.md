@@ -170,42 +170,37 @@ where the point is that the database refuses something.
     [rbac] supervisor over-receipt -> 201 over_receipt=true
     [rbac] self-approval refused by po_maker_checker
     [invariant] 72,000 on a 50,000 limit -> 403 approval_limit_exceeded
-    [invariant] refused by ERP07: movement 1 books 12.50 but entry 1 posts 99.00 to Inventory
-    [invariant] refused by ERP06: entry 3 does not exactly reverse entry 2
-    [invariant] refused by ERP09: stock_balances is a projection
-    [invariant] refused by ERP08: reservation 1 is CONSUMED; terminal states cannot be revived
-    [invariant] refused by ERP11: PO is approved; its value cannot change
-    [invariant] posting into closed 2026-08-01 -> 409 period_closed
-    [invariant] refused by one_live_hold_per_line, res_expiry_sane,
-                movement_sign_matches_type, sol_not_over_fulfilled, ERP02
+    [invariant] ERP07 movement 1 books 12.50 but entry 1 posts 99.00 to Inventory
+    [invariant] ERP06 entry 3 does not exactly reverse entry 2
+    [invariant] posting into a closed period -> 409 period_closed
+    [invariant] also refused: ERP08 ERP09 ERP11 ERP02, one_live_hold_per_line,
+                res_expiry_sane, movement_sign_matches_type, sol_not_over_fulfilled
 
-The reconciliation *total* is deliberately not quoted: node:test runs the files
-concurrently, so the figure depends on which other tests have committed at that
-instant. Across four consecutive full runs it was 653.50, 517.50, 605.50 and
-1252.50 -- and `delta` was `0.00` with `status=TIES` every time. The equality is
-the invariant; the total is not. Four runs, 51/51, no flakes.
+The reconciliation *total* is deliberately not quoted. `node:test` runs the
+files concurrently, so the figure depends on which other tests have committed at
+that instant: across four consecutive runs it was 653.50, 517.50, 605.50 and
+1252.50, while `delta` was `0.00` and `status=TIES` every time. The equality is
+the invariant; the total is not. 51/51 on all four runs, no flakes.
 
 ### Is the suite actually load-bearing?
 
 A test that has never failed is not evidence, so `scripts/mutation-check.sh`
-breaks one mechanism at a time and checks the suite goes red. Six of eight
-mutations are caught. **Two survive, and the script says so rather than hiding
-it:**
+breaks one mechanism at a time and checks the suite goes red. Six of eight are
+caught. **Two survive, and the script declares them rather than hiding it:**
 
-- **Removing the service-level `FOR UPDATE` on the PO line.** Correctness here
-  actually comes from `check_over_receipt()`, which takes its own lock. Without
-  the service lock two callers can both pass the pre-check and the trigger
-  rejects the second — the final state is still right, so no black-box test can
-  separate the two. The service lock is kept because it turns that into a clean
-  422 carrying the arithmetic instead of a wasted transaction and a bare
-  constraint error.
-- **Removing `SET CONSTRAINTS ALL IMMEDIATE`.** The deferred trigger then fires
-  during `COMMIT`; `withTx` still rolls back and the error still maps to the
-  same 422. Kept because it raises the failure where a caller could still handle
-  it, not because a test proves it.
+- **The service-level `FOR UPDATE` on the PO line.** Correctness there actually
+  comes from `check_over_receipt()`, which takes its own lock. Without the
+  service lock both callers pass the pre-check and the trigger rejects the
+  second — the final state is still right, so no black-box test separates them.
+  It is kept because it turns that into a clean 422 carrying the arithmetic
+  instead of a wasted transaction and a bare constraint error.
+- **`SET CONSTRAINTS ALL IMMEDIATE`.** Without it the deferred trigger fires
+  during `COMMIT`; `withTx` still rolls back and the error maps to the same 422.
+  Re-checked against the new invariant tests: still not observable. Kept because
+  it raises the failure where a caller could handle it, not because a test proves it.
 
-Finding these is the reason the script exists. Before it, I would have claimed
-the PO-line lock was what made concurrent receipts safe.
+Before that script I would have claimed the PO-line lock was what made
+concurrent receipts safe.
 
 ## Honest limits
 
