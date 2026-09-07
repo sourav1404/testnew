@@ -7,7 +7,7 @@ over one PostgreSQL database. TypeScript, Express, `pg`, no ORM.
     docker run -d --name erp-pg -p 55432:5432 -e POSTGRES_PASSWORD=erp postgres:16
     createdb northwind            # or: psql -c 'CREATE DATABASE northwind'
     npm run migrate && npm run seed
-    npm test                      # 67 tests
+    npm test                      # 83 tests
     npm start                     # :3000
 
 `npm run verify` does migrate -> seed -> typecheck -> test in one go.
@@ -145,7 +145,7 @@ Stated because the brief is underspecified on purpose.
 
 ## Test evidence
 
-67 tests, all through HTTP against the real app or straight at the database
+83 tests, all through HTTP against the real app or straight at the database
 where the point is that the database refuses something.
 
     [concurrency] 12 requests, 3 units: winners=3 totalReserved=3 on_hand=3.0000 reserved=3.0000 available=0.0000
@@ -179,6 +179,14 @@ where the point is that the database refuses something.
     [idem] fulfil sent twice with one key: 200/200 replay=true on_hand=6.0000
     [idem] same key, different body -> 409 idempotency_key_reuse
     [idem] after a 422, same key with a valid body -> 201 replay=false
+    [precision] 1 x 1.005 -> total_amount 1.01     (the float path produced 1.00)
+    [precision] 3 @ 0.07 cost, 3 @ 1.005 price -> cogs=0.21 revenue=3.02, both entries balance
+    [audit] SO confirmed_by=sales@nw.test confirmed_at set=true
+    [audit] bare status flip refused by so_confirmed_has_actor
+    [idem] keys reordered -> 201 replay=true
+    [idem] reclaiming a 10-minute-old in-flight claim -> 201 replay=false
+    [idem] fresh in-flight claim -> 409 request_in_flight
+    [idem] purge: 1 stale key(s) -> purged 1, 0 left
     [invariant] 72,000 on a 50,000 limit -> 403 approval_limit_exceeded
     [invariant] ERP07 movement 1 books 12.50 but entry 1 posts 99.00 to Inventory
     [invariant] ERP06 entry 3 does not exactly reverse entry 2
@@ -218,11 +226,47 @@ One thing held: parameterisation. `unit_price: "'; DROP TABLE users; --"` came
 back `400 bad_request` and `/whoami` still worked, so the value reached Postgres
 as data. `tests/validation.test.ts` locks all ten cases down.
 
+### The four rough edges from the last review, closed
+
+A reviewer named four non-critical but real defects. All four are fixed, each
+with a test and a mutation that proves the test bites:
+
+- **Money arithmetic was float, contradicting the stated rationale.** `db.ts`
+  keeps money as strings because "a float would silently lose the cent that this
+  whole system exists to keep track of" -- and the services then did
+  `Number(a) * Number(b)` and `.toFixed(2)`. That loses cents:
+  `(1.005).toFixed(2)` is `"1.00"`. `src/money.ts` now does exact BigInt
+  arithmetic scaled to 8 places with half-away-from-zero rounding, matching
+  Postgres `round()`. Measured end to end: a PO for `1 x 1.005` now totals
+  `1.01`, where the float path produced `1.00`.
+- **The idempotency request hash was order-sensitive.** `JSON.stringify`
+  preserves insertion order, so the same receipt sent as `{qty, po_line_id}`
+  and `{po_line_id, qty}` hashed differently and the retry was rejected as key
+  reuse instead of replayed. Hashing is now over a canonical form with sorted
+  keys; measured, a reordered body replays.
+- **An abandoned in-flight claim had no reclaim path.** The claim shares the
+  effect's transaction, so a crash rolls it back -- I verified that a rollback
+  after the claim leaves zero rows. But "unreachable" is not a reclaim path, so
+  a claim with no response older than five minutes is now taken over rather
+  than answered 409 forever. A genuinely fresh in-flight claim still gets 409,
+  and a mismatched body still reports reuse, which is the more specific answer.
+- **`confirmSalesOrder` discarded its `actorId` with `void actorId`.** Confirming
+  is the one privileged act on a sales order -- it takes stock out of
+  circulation -- and it left no trace. `sales_orders` now has
+  `confirmed_by`/`confirmed_at`, a CHECK that the pair is consistent, and a
+  second CHECK (`so_confirmed_has_actor`) so a bare `status='CONFIRMED'` flip is
+  refused by the database, not just avoided by the service.
+
+Two limits named in the last submission are also closed: `idempotency_keys` is
+purged past a 30-day retention window by the same scheduler tick that sweeps
+reservations, and the `as_of` reconciliation filters both sides by the entry's
+accounting date rather than one side by a physical timestamp.
+
 ### Is the suite actually load-bearing?
 
 A test that has never failed is not evidence, so `scripts/mutation-check.sh`
-breaks one mechanism at a time and checks the suite goes red. Eleven of
-thirteen are caught. **Two survive, and the script declares them rather than hiding it:**
+breaks one mechanism at a time and checks the suite goes red. Sixteen of
+eighteen are caught. **Two survive, and the script declares them rather than hiding it:**
 
 - **The service-level `FOR UPDATE` on the PO line.** Correctness there actually
   comes from `check_over_receipt()`, which takes its own lock. Without the
@@ -253,8 +297,14 @@ concurrent receipts safe.
   per movement would make it auditable; not done.
 - **Idempotency covers the nine mutating routes, not the reads.** A retried
   `POST /goods-receipts` with the same `Idempotency-Key` replays instead of
-  receiving twice (measured: `on_hand=40.0000`, not 80). There is no expiry
-  sweep on `idempotency_keys`, so the table grows without bound.
+  receiving twice (measured: `on_hand=40.0000`, not 80).
+- **Reservation history is convention, not enforcement.** `forbid_mutation` is
+  on `ledger_entries`, `ledger_lines` and `stock_movements` but not on
+  `stock_reservations`, so a `DELETE` there would succeed and `sync_reserved()`
+  would recompute the balance correctly afterwards -- the history would vanish
+  with no inconsistency to detect it. No code path does this; nothing stops one.
+  If the `EXPIRED` versus `RELEASED` distinction is audit-grade, the trigger
+  belongs on that table too.
 - **The bearer token is an email address.** Fine for this stage, not an auth
   system.
 - **No returns/credit notes.** The highest-value omission and the first thing I
