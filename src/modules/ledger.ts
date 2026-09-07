@@ -128,8 +128,14 @@ export async function reconcileInventory(tx: Tx, asOf?: string) {
     subledger_value: string; gl_value: string; delta: string; unbalanced_entries: string;
   }>(
     `WITH sub AS (
-       SELECT COALESCE(SUM(m.booked_value), 0) AS v FROM stock_movements m
-        WHERE $1::date IS NULL OR m.created_at::date <= $1::date),
+       -- Filtered by the entry's accounting date, not the movement's physical
+       -- created_at. An as_of report is an accounting question, and the two
+       -- columns can disagree: a movement written just after midnight against
+       -- an entry dated the previous day would land on opposite sides of the
+       -- cutoff and manufacture a delta that does not exist.
+       SELECT COALESCE(SUM(m.booked_value), 0) AS v
+         FROM stock_movements m JOIN ledger_entries e2 ON e2.id = m.ledger_entry_id
+        WHERE $1::date IS NULL OR e2.entry_date <= $1::date),
      gl AS (
        SELECT COALESCE(SUM(l.amount), 0) AS v
          FROM ledger_lines l JOIN ledger_entries e ON e.id = l.entry_id

@@ -7,7 +7,7 @@ over one PostgreSQL database. TypeScript, Express, `pg`, no ORM.
     docker run -d --name erp-pg -p 55432:5432 -e POSTGRES_PASSWORD=erp postgres:16
     createdb northwind            # or: psql -c 'CREATE DATABASE northwind'
     npm run migrate && npm run seed
-    npm test                      # 38 tests
+    npm test                      # 51 tests
     npm start                     # :3000
 
 `npm run verify` does migrate → seed → typecheck → test in one go.
@@ -52,8 +52,12 @@ service layer, where they are visible.
 | Roles that conflict cannot be co-held | `incompatible_roles` + trigger |
 | API authorisation | `requirePermission` middleware, per route |
 
-Stage 1 claimed several of these in prose. This stage only claims what a test
-exercises; §"Honest limits" below says what is still unproven.
+Stage 1 claimed several of these in prose. Every rule in that table now has a
+test that attempts a real violation and asserts the refusal -- an audit part-way
+through this stage found that sentence was not yet true, because several
+invariants had never been made to reject anything. `tests/invariants.test.ts`
+covers the thirteen that were missing. §"Honest limits" still says what is
+unproven.
 
 ## What changed from the Stage 1 design, and why
 
@@ -138,7 +142,8 @@ Stated because the brief is underspecified on purpose.
 
 ## Test evidence
 
-38 tests, all through HTTP against the real app.
+51 tests, all through HTTP against the real app or straight at the database
+where the point is that the database refuses something.
 
     [concurrency] 12 requests, 3 units: winners=3 totalReserved=3 on_hand=3.0000 reserved=3.0000 available=0.0000
     [concurrency] 20 requests, 1 unit: winners=1 reserved=1.0000 available=0.0000
@@ -154,7 +159,7 @@ Stated because the brief is underspecified on purpose.
     [fulfil] first shipment: status=PARTIALLY_FULFILLED shipped=5.0000 cogs=50.00 backordered=3.0000
     [fulfil] second shipment: status=FULFILLED shipped=3.0000 unit_cost=20.0000
     [fulfil] sweep expired=1 -> available=1.0000
-    [ledger] subledger=1985.00 gl_1300=1985.00 delta=0.00 unbalanced=0 status=TIES
+    [ledger] delta=0.00 unbalanced=0 status=TIES          (subledger == gl_1300)
     [ledger] trial balance total=0.00 across 8 accounts
     [ledger] UPDATE on entry 1 -> ERP02: ledger_entries is append-only
     [ledger] double reversal -> 409 already_reversed
@@ -164,6 +169,21 @@ Stated because the brief is underspecified on purpose.
     [rbac] operator over-receipt -> 422 (requires the receipt.over_receive permission)
     [rbac] supervisor over-receipt -> 201 over_receipt=true
     [rbac] self-approval refused by po_maker_checker
+    [invariant] 72,000 on a 50,000 limit -> 403 approval_limit_exceeded
+    [invariant] refused by ERP07: movement 1 books 12.50 but entry 1 posts 99.00 to Inventory
+    [invariant] refused by ERP06: entry 3 does not exactly reverse entry 2
+    [invariant] refused by ERP09: stock_balances is a projection
+    [invariant] refused by ERP08: reservation 1 is CONSUMED; terminal states cannot be revived
+    [invariant] refused by ERP11: PO is approved; its value cannot change
+    [invariant] posting into closed 2026-08-01 -> 409 period_closed
+    [invariant] refused by one_live_hold_per_line, res_expiry_sane,
+                movement_sign_matches_type, sol_not_over_fulfilled, ERP02
+
+The reconciliation *total* is deliberately not quoted: node:test runs the files
+concurrently, so the figure depends on which other tests have committed at that
+instant. Across four consecutive full runs it was 653.50, 517.50, 605.50 and
+1252.50 -- and `delta` was `0.00` with `status=TIES` every time. The equality is
+the invariant; the total is not. Four runs, 51/51, no flakes.
 
 ### Is the suite actually load-bearing?
 
@@ -189,6 +209,11 @@ the PO-line lock was what made concurrent receipts safe.
 
 ## Honest limits
 
+- **`as_of` reconciliation now filters both sides by the entry's accounting
+  date.** It previously filtered movements by their physical `created_at` and
+  the ledger by `entry_date`; the two agree in normal operation, but a movement
+  written just after midnight against an entry dated the previous day would land
+  on opposite sides of the cutoff and manufacture a delta that does not exist.
 - **Contention, not throughput.** Every reserver for one SKU serialises on one
   `stock_balances` row, and `sync_reserved()` rewrites it with an `O(holds)`
   `SUM` each time. Correctness under contention is measured; throughput is not.
