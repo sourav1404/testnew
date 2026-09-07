@@ -2,6 +2,7 @@ import express, { type NextFunction, type Request, type Response } from "express
 import { withTx } from "./db.js";
 import { ApiError, toApiError } from "./errors.js";
 import { actorOf, authenticate, requirePermission } from "./auth.js";
+import { cors } from "./cors.js";
 import { purgeIdempotencyKeys, runIdempotent } from "./idempotency.js";
 import * as inventory from "./modules/inventory.js";
 import * as ledger from "./modules/ledger.js";
@@ -29,6 +30,9 @@ const str = (v: unknown, name: string): string => {
 
 export function createApp() {
   const app = express();
+  // Before json() and before authenticate(): a preflight has no body and no
+  // Authorization header.
+  app.use(cors);
   app.use(express.json());
 
   app.get("/health", (_req, res) => { res.json({ status: "ok" }); });
