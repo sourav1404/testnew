@@ -1,4 +1,4 @@
-# Northwind Mini-ERP — Backend (Stage 2)
+# Northwind Mini-ERP -- Backend (Stage 2)
 
 Inventory, Procurement, Sales fulfilment and a Financial Ledger as one service
 over one PostgreSQL database. TypeScript, Express, `pg`, no ORM.
@@ -10,7 +10,7 @@ over one PostgreSQL database. TypeScript, Express, `pg`, no ORM.
     npm test                      # 51 tests
     npm start                     # :3000
 
-`npm run verify` does migrate → seed → typecheck → test in one go.
+`npm run verify` does migrate -> seed -> typecheck -> test in one go.
 `./scripts/mutation-check.sh` breaks each safety mechanism in turn and checks
 that the suite notices.
 
@@ -39,16 +39,16 @@ service layer, where they are visible.
 
 | Rule | Enforced by |
 |---|---|
-| Stock never goes negative | `no_oversell` CHECK — the backstop |
-| Reservation is safe under load | `SELECT … FOR UPDATE` in `confirmSalesOrder` |
+| Stock never goes negative | `no_oversell` CHECK -- the backstop |
+| Reservation is safe under load | `SELECT ... FOR UPDATE` in `confirmSalesOrder` |
 | A movement always has a journal entry | `ledger_entry_id NOT NULL` |
 | The entry books what the movement books | `movement_ties_to_ledger` (deferred) |
-| Every entry balances, ≥ 2 lines | `ledger_entry_complete` (deferred) |
+| Every entry balances, >= 2 lines | `ledger_entry_complete` (deferred) |
 | Posted entries are immutable | `BEFORE UPDATE OR DELETE` triggers |
 | A reversal exactly mirrors its original | `reversal_mirrors_original` (deferred) |
 | No manual journal into a control account | `guard_ledger_line` |
 | Over-receipt is explicit | service pre-check + `check_over_receipt` |
-| Maker ≠ checker; within limit | `po_maker_checker`, `po_within_limit` CHECKs |
+| Maker != checker; within limit | `po_maker_checker`, `po_within_limit` CHECKs |
 | Roles that conflict cannot be co-held | `incompatible_roles` + trigger |
 | API authorisation | `requirePermission` middleware, per route |
 
@@ -56,7 +56,7 @@ Stage 1 claimed several of these in prose. Every rule in that table now has a
 test that attempts a real violation and asserts the refusal -- an audit part-way
 through this stage found that sentence was not yet true, because several
 invariants had never been made to reject anything. `tests/invariants.test.ts`
-covers the thirteen that were missing. §"Honest limits" still says what is
+covers the thirteen that were missing. section "Honest limits" still says what is
 unproven.
 
 ## What changed from the Stage 1 design, and why
@@ -71,7 +71,7 @@ All four changes were forced by building it, not by taste.
    was unreachable. The row is now materialised neutrally and all arithmetic
    happens in the `UPDATE`, so the constraint only sees the true post-state.
 2. **`sales_order_lines.fulfilled_qty` added.** `so_status` had
-   `PARTIALLY_FULFILLED`, but nothing could represent it — `stock_movements` has
+   `PARTIALLY_FULFILLED`, but nothing could represent it -- `stock_movements` has
    no line reference and its `source_doc_id` points at the order. Backordered
    quantity is now derived (`sales_order_line_status`), never stored.
 3. **`check_over_receipt()` locks the PO line `FOR UPDATE`.** Stage 1 admitted
@@ -82,8 +82,8 @@ All four changes were forced by building it, not by taste.
 
 ## API
 
-    GET  /health                                    -- unauthenticated
-    GET  /whoami                                    -- roles and permissions
+    GET  /health -- unauthenticated
+    GET  /whoami -- roles and permissions
     GET  /inventory/availability?sku&warehouse      inventory.read
     GET  /inventory/movements?sku                   inventory.read
     POST /inventory/adjustments                     inventory.adjust
@@ -101,7 +101,7 @@ All four changes were forced by building it, not by taste.
     POST /ledger/entries                            ledger.post_manual
     POST /ledger/entries/:id/reverse                ledger.reverse
 
-Auth is `Authorization: Bearer <email>` — a deliberate stand-in for a real
+Auth is `Authorization: Bearer <email>` -- a deliberate stand-in for a real
 identity provider, so tests can assume a role without a login flow. The roles
 and permissions behind it are real, read from the database on every request.
 
@@ -110,11 +110,11 @@ and permissions behind it are real, read from the database on every request.
 | Event | Movement | Journal |
 |---|---|---|
 | Goods receipt (partial ok) | +qty @ PO price | DR 1300 / CR 2100 |
-| Fulfilment — cost | −qty @ moving average | DR 5000 / CR 1300 |
-| Fulfilment — revenue | none | DR 1200 / CR 4000 |
-| Stock adjustment | ±qty @ moving average | DR/CR 1300 vs 5900 |
-| Reservation held/released/expired | none | none — no economic event |
-| PO approval, cancellation | none | none — no goods, no obligation |
+| Fulfilment -- cost | -qty @ moving average | DR 5000 / CR 1300 |
+| Fulfilment -- revenue | none | DR 1200 / CR 4000 |
+| Stock adjustment | +/-qty @ moving average | DR/CR 1300 vs 5900 |
+| Reservation held/released/expired | none | none -- no economic event |
+| PO approval, cancellation | none | none -- no goods, no obligation |
 
 A reservation is not a stock movement: nothing has moved, so nothing is posted.
 
@@ -138,7 +138,7 @@ Stated because the brief is underspecified on purpose.
   approve their own purchase order, every other rule here is decoration.
 - **Warehouses have no bin locations.**
 - Correcting a *goods receipt* is a compensating inventory adjustment, not a
-  ledger reversal — see the guard in `reverseEntry`.
+  ledger reversal -- see the guard in `reverseEntry`.
 
 ## Test evidence
 
@@ -191,7 +191,7 @@ caught. **Two survive, and the script declares them rather than hiding it:**
 - **The service-level `FOR UPDATE` on the PO line.** Correctness there actually
   comes from `check_over_receipt()`, which takes its own lock. Without the
   service lock both callers pass the pre-check and the trigger rejects the
-  second — the final state is still right, so no black-box test separates them.
+  second -- the final state is still right, so no black-box test separates them.
   It is kept because it turns that into a clean 422 carrying the arithmetic
   instead of a wasted transaction and a bare constraint error.
 - **`SET CONSTRAINTS ALL IMMEDIATE`.** Without it the deferred trigger fires
