@@ -2,7 +2,7 @@ import express, { type NextFunction, type Request, type Response } from "express
 import { withTx } from "./db.js";
 import { ApiError, toApiError } from "./errors.js";
 import { actorOf, authenticate, requirePermission } from "./auth.js";
-import { runIdempotent } from "./idempotency.js";
+import { purgeIdempotencyKeys, runIdempotent } from "./idempotency.js";
 import * as inventory from "./modules/inventory.js";
 import * as ledger from "./modules/ledger.js";
 import * as procurement from "./modules/procurement.js";
@@ -134,9 +134,14 @@ export function createApp() {
     res.json(out);
   }));
 
+  // One scheduler tick: release lapsed holds and retire idempotency keys past
+  // their retention window. Both are maintenance on the same clock.
   app.post("/reservations/expire", requirePermission("so.fulfil"), h(async (_req, res) => {
-    const expired = await withTx((tx) => sales.expireReservations(tx));
-    res.json({ expired });
+    const out = await withTx(async (tx) => ({
+      expired: await sales.expireReservations(tx),
+      idempotency_keys_purged: await purgeIdempotencyKeys(tx),
+    }));
+    res.json(out);
   }));
 
   // ---------------------------------------------------------------- ledger

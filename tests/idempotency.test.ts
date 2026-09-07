@@ -1,7 +1,8 @@
 import { after, before, describe, it } from "node:test";
 import assert from "node:assert/strict";
 import { closePool } from "../src/db.js";
-import { type Api, balanceOf, call, freshProduct, startApi, uniq } from "./helpers.js";
+import { requestHash } from "../src/idempotency.js";
+import { type Api, balanceOf, call, freshProduct, sql, startApi, uniq } from "./helpers.js";
 
 let api: Api;
 before(async () => { api = await startApi(); });
@@ -162,5 +163,97 @@ describe("idempotency: a retried mutation must not double-apply", () => {
     assert.equal(b.replay, "true");
     assert.equal(b.body.cogs_entry_id, a.body.cogs_entry_id);
     assert.equal(balance.on_hand_qty, "6.0000", "four shipped once, not eight");
+  });
+  it("key order in the body does not change the key's identity", async () => {
+    // JSON.stringify preserves insertion order, so the same receipt sent with
+    // its keys in a different order used to hash differently and be rejected as
+    // a key reuse instead of replayed.
+    const sku = await freshProduct();
+    const { id, lineId } = await approvedPo(sku, "50");
+    const key = uniq("idem");
+    const a = await callKeyed("wh@nw.test", "POST", `/purchase-orders/${id}/goods-receipts`, key,
+      { lines: [{ po_line_id: lineId, received_qty: "5" }] });
+    const b = await callKeyed("wh@nw.test", "POST", `/purchase-orders/${id}/goods-receipts`, key,
+      { lines: [{ received_qty: "5", po_line_id: lineId }] });   // same data, keys swapped
+    console.log(`  [idem] keys reordered -> ${b.status} replay=${b.replay}`);
+    assert.equal(a.status, 201);
+    assert.equal(b.status, 201);
+    assert.equal(b.replay, "true", "reordered keys are the same request, so it replays");
+    assert.equal((await balanceOf(sku)).on_hand_qty, "5.0000", "received once");
+  });
+
+  it("an abandoned in-flight claim can be reclaimed instead of wedging forever", async () => {
+    // The claim shares the effect's transaction, so a crash rolls it back and
+    // this state should be unreachable -- but "unreachable" is not a reclaim
+    // path. Plant the row a stalled writer would leave and prove there is a way
+    // out.
+    const sku = await freshProduct();
+    const { id, lineId } = await approvedPo(sku, "20");
+    const key = uniq("idem");
+    const endpoint = "POST /purchase-orders/:id/goods-receipts";
+    await sql(`INSERT INTO idempotency_keys
+                 (endpoint, key, request_hash, response_code, response_body, created_at)
+               VALUES ($1, $2, 'stale-hash', 0, '{}'::jsonb, now() - interval '10 minutes')`,
+              [endpoint, key]);
+
+    const res = await callKeyed("wh@nw.test", "POST", `/purchase-orders/${id}/goods-receipts`, key,
+      { lines: [{ po_line_id: lineId, received_qty: "7" }] });
+    console.log(`  [idem] reclaiming a 10-minute-old in-flight claim -> ${res.status} replay=${res.replay}`);
+    assert.equal(res.status, 201, "the abandoned claim was taken over, not answered with 409");
+    assert.equal((await balanceOf(sku)).on_hand_qty, "7.0000");
+  });
+
+  it("a genuinely in-flight claim is still refused", async () => {
+    const sku = await freshProduct();
+    const { id, lineId } = await approvedPo(sku, "5");
+    const key = uniq("idem");
+    const endpoint = "POST /purchase-orders/:id/goods-receipts";
+    const body = { lines: [{ po_line_id: lineId, received_qty: "1" }] };
+    // The hash must MATCH, or the mismatch branch answers first -- which is the
+    // correct precedence, and is what my first version of this test tripped on.
+    const hash = requestHash("POST", `/purchase-orders/${id}/goods-receipts`, body);
+    await sql(`INSERT INTO idempotency_keys
+                 (endpoint, key, request_hash, response_code, response_body)
+               VALUES ($1, $2, $3, 0, '{}'::jsonb)`, [endpoint, key, hash]);
+
+    const res = await callKeyed("wh@nw.test", "POST",
+      `/purchase-orders/${id}/goods-receipts`, key, body);
+    console.log(`  [idem] fresh in-flight claim -> ${res.status} ${res.body.error}`);
+    assert.equal(res.status, 409);
+    assert.equal(res.body.error, "request_in_flight");
+    assert.match(String(res.body.message), /reclaimable after/);
+  });
+
+  it("a mismatched body is reported as reuse even while one is in flight", async () => {
+    // Precedence check: hash mismatch is the more specific answer.
+    const sku = await freshProduct();
+    const { id, lineId } = await approvedPo(sku, "5");
+    const key = uniq("idem");
+    await sql(`INSERT INTO idempotency_keys
+                 (endpoint, key, request_hash, response_code, response_body)
+               VALUES ($1, $2, 'a-different-request', 0, '{}'::jsonb)`,
+              ["POST /purchase-orders/:id/goods-receipts", key]);
+    const res = await callKeyed("wh@nw.test", "POST",
+      `/purchase-orders/${id}/goods-receipts`, key,
+      { lines: [{ po_line_id: lineId, received_qty: "1" }] });
+    console.log(`  [idem] in-flight + different body -> ${res.status} ${res.body.error}`);
+    assert.equal(res.status, 409);
+    assert.equal(res.body.error, "idempotency_key_reuse");
+  });
+
+  it("keys past their retention window are purged by the scheduler tick", async () => {
+    await sql(`INSERT INTO idempotency_keys
+                 (endpoint, key, request_hash, response_code, response_body, created_at)
+               VALUES ('POST /old', $1, 'h', 201, '{}'::jsonb, now() - interval '40 days')`,
+              [uniq("old")]);
+    const before = await sql(`SELECT count(*)::int n FROM idempotency_keys
+                               WHERE created_at < now() - interval '30 days'`);
+    const tick = await call(api, "ship@nw.test", "POST", "/reservations/expire");
+    const after = await sql(`SELECT count(*)::int n FROM idempotency_keys
+                              WHERE created_at < now() - interval '30 days'`);
+    console.log(`  [idem] purge: ${before.rows[0].n} stale key(s) ->`,
+      `purged ${tick.body.idempotency_keys_purged}, ${after.rows[0].n} left`);
+    assert.ok(before.rows[0].n >= 1);
+    assert.equal(after.rows[0].n, 0, "the table no longer grows without bound");
   });
 });

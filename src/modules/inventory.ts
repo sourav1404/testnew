@@ -1,5 +1,6 @@
 import type { Tx } from "../db.js";
 import { ApiError } from "../errors.js";
+import { money } from "../money.js";
 import { postEntry } from "./ledger.js";
 
 /** Current stock, derived. There is no quantity_on_hand column anywhere. */
@@ -59,7 +60,7 @@ export async function postAdjustment(tx: Tx, input: AdjustmentInput) {
     [loc.productId, loc.warehouseId]);
 
   const unitCost = balance.rows[0]?.avg_unit_cost ?? "0";
-  const bookedValue = (Number(input.qtyDelta) * Number(unitCost)).toFixed(2);
+  const bookedValue = money.mul(input.qtyDelta, unitCost, 2, "qty_delta");
 
   const entryId = await postEntry(tx, {
     sourceDoc: "inventory_adjustment",
@@ -68,7 +69,7 @@ export async function postAdjustment(tx: Tx, input: AdjustmentInput) {
     createdBy: input.actorId,
     lines: [
       { account: "1300", amount: bookedValue, productId: loc.productId, warehouseId: loc.warehouseId },
-      { account: "5900", amount: (-Number(bookedValue)).toFixed(2) },
+      { account: "5900", amount: money.neg(bookedValue) },
     ],
   });
 

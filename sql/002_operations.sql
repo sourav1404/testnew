@@ -102,12 +102,21 @@ CREATE TYPE so_status AS ENUM
 CREATE TYPE reservation_status AS ENUM ('HELD','CONSUMED','RELEASED','EXPIRED');
 
 CREATE TABLE sales_orders (
-  id          bigserial PRIMARY KEY,
-  so_number   text NOT NULL UNIQUE,
-  customer_id bigint NOT NULL REFERENCES customers(id),
-  status      so_status NOT NULL DEFAULT 'DRAFT',
-  created_by  bigint NOT NULL REFERENCES users(id),
-  created_at  timestamptz NOT NULL DEFAULT now()
+  id           bigserial PRIMARY KEY,
+  so_number    text NOT NULL UNIQUE,
+  customer_id  bigint NOT NULL REFERENCES customers(id),
+  status       so_status NOT NULL DEFAULT 'DRAFT',
+  created_by   bigint NOT NULL REFERENCES users(id),
+  created_at   timestamptz NOT NULL DEFAULT now(),
+  -- Who committed the stock, and when. confirmSalesOrder took an actorId and
+  -- discarded it, which left the one privileged act on a sales order -- taking
+  -- stock out of circulation -- with no audit trail at all.
+  confirmed_by bigint REFERENCES users(id),
+  confirmed_at timestamptz,
+  CONSTRAINT so_confirmation_complete CHECK ((confirmed_by IS NULL) = (confirmed_at IS NULL)),
+  -- A confirmed order must name who confirmed it.
+  CONSTRAINT so_confirmed_has_actor CHECK (
+    status = 'DRAFT' OR status = 'CANCELLED' OR confirmed_by IS NOT NULL)
 );
 CREATE TABLE sales_order_lines (
   id            bigserial PRIMARY KEY,

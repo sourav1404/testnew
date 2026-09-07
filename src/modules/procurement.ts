@@ -1,5 +1,6 @@
 import type { Tx } from "../db.js";
 import { ApiError } from "../errors.js";
+import { money } from "../money.js";
 import { resolveLocation } from "./inventory.js";
 import { postEntry } from "./ledger.js";
 
@@ -27,8 +28,9 @@ export async function createPurchaseOrder(
     resolved.push({ line, loc: await resolveLocation(tx, line.sku, line.warehouse) });
   }
 
-  const total = input.lines
-    .reduce((s, l) => s + Number(l.qty) * Number(l.unitPrice), 0).toFixed(2);
+  // Exact decimal throughout: see src/money.ts. The float version of this
+  // line lost a cent on values like 1.005 x 1.
+  const total = money.sum(input.lines.map((l) => money.mul(l.qty, l.unitPrice, 2, "unit_price")));
 
   const po = await tx.query<{ id: string }>(
     `INSERT INTO purchase_orders (po_number, supplier_id, status, total_amount, created_by)
@@ -145,8 +147,8 @@ export async function receiveGoods(
   // is one verdict for the whole receipt rather than a half-applied batch.
   const planned = input.lines.map((line) => {
     const po_line = byId.get(line.poLineId)!;
-    const after = Number(po_line.received) + Number(line.receivedQty);
-    const isOver = after > Number(po_line.ordered_qty);
+    const after = money.add(po_line.received, line.receivedQty, 4, "received_qty");
+    const isOver = money.cmp(after, po_line.ordered_qty) > 0;
     if (isOver && !(line.allowOverReceipt && input.mayOverReceive)) {
       throw new ApiError(422, "over_receipt",
         `over-receipt on PO line ${line.poLineId}`, {
@@ -172,18 +174,18 @@ export async function receiveGoods(
   // account ties per SKU, which is what movement_ties_to_ledger checks.
   const entryLines = planned.map(({ line, po_line }) => ({
     account: "1300",
-    amount: (Number(line.receivedQty) * Number(po_line.unit_price)).toFixed(2),
+    amount: money.mul(line.receivedQty, po_line.unit_price, 2, "received_qty"),
     productId: Number(po_line.product_id),
     warehouseId: Number(po_line.warehouse_id),
   }));
-  const grossValue = entryLines.reduce((s, l) => s + Number(l.amount), 0).toFixed(2);
+  const grossValue = money.sum(entryLines.map((l) => l.amount));
 
   const entryId = await postEntry(tx, {
     sourceDoc: "goods_receipt",
     sourceDocId: receiptId,
     memo: `Goods receipt ${receiptId} against PO ${input.poId}`,
     createdBy: input.actorId,
-    lines: [...entryLines, { account: "2100", amount: (-Number(grossValue)).toFixed(2) }],
+    lines: [...entryLines, { account: "2100", amount: money.neg(grossValue) }],
   });
 
   const out = [];
@@ -203,12 +205,12 @@ export async function receiveGoods(
        VALUES ($1, $2, $3, $4, $5)`,
       [receiptId, line.poLineId, line.receivedQty, movement.rows[0]!.id, isOver]);
 
-    const remaining = Number(po_line.ordered_qty)
-      - Number(po_line.received) - Number(line.receivedQty);
+    const remaining = money.sub(
+      money.sub(po_line.ordered_qty, po_line.received, 4), line.receivedQty, 4);
     out.push({
       po_line_id: line.poLineId,
       received_qty: line.receivedQty,
-      outstanding_qty: remaining.toFixed(4),
+      outstanding_qty: remaining,
       over_receipt: isOver,
       stock_movement_id: movement.rows[0]!.id,
     });

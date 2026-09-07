@@ -1,5 +1,6 @@
 import type { Tx } from "../db.js";
 import { ApiError } from "../errors.js";
+import { money } from "../money.js";
 
 export interface EntryLine {
   account: string;
@@ -97,7 +98,7 @@ export async function reverseEntry(
     reversesId: originalId,
     lines: lines.rows.map((l) => ({
       account: l.account_code,
-      amount: (-Number(l.amount)).toFixed(2),
+      amount: money.neg(l.amount),
       productId: l.product_id ? Number(l.product_id) : undefined,
       warehouseId: l.warehouse_id ? Number(l.warehouse_id) : undefined,
     })),
@@ -113,8 +114,8 @@ export async function trialBalance(tx: Tx, asOf?: string) {
         AND ($1::date IS NULL OR e.entry_date <= $1::date)
       GROUP BY a.code, a.name, a.kind
       ORDER BY a.code`, [asOf ?? null]);
-  const total = rows.reduce((s, r) => s + Number(r.balance), 0);
-  return { as_of: asOf ?? null, accounts: rows, total_must_be_zero: total.toFixed(2) };
+  const total = money.sum(rows.map((r) => String(r.balance)));
+  return { as_of: asOf ?? null, accounts: rows, total_must_be_zero: total };
 }
 
 /**
@@ -162,7 +163,7 @@ export async function reconcileInventory(tx: Tx, asOf?: string) {
     gl_inventory_value: r.gl_value,
     delta: r.delta,
     unbalanced_entries: Number(r.unbalanced_entries),
-    status: Number(r.delta) === 0 && Number(r.unbalanced_entries) === 0 ? "TIES" : "DRIFT",
+    status: money.isZero(r.delta) && Number(r.unbalanced_entries) === 0 ? "TIES" : "DRIFT",
     by_product: byProduct.rows,
   };
 }

@@ -1,5 +1,6 @@
 import type { Tx } from "../db.js";
 import { ApiError } from "../errors.js";
+import { money } from "../money.js";
 import { resolveLocation } from "./inventory.js";
 import { postEntry } from "./ledger.js";
 
@@ -97,32 +98,40 @@ export async function confirmSalesOrder(tx: Tx, soId: number, ttlMinutes: number
 
   const results = [];
   for (const line of lines.rows) {
-    const outstanding = Number(line.want) - Number(line.held);
-    if (outstanding <= 0) {
-      results.push({ sku: line.sku, reserved: "0", backordered: "0", note: "already held" });
+    // Quantities are numeric(14,4); all arithmetic goes through money.ts so a
+    // float cannot round a quantity into or out of existence.
+    const outstanding = money.sub(line.want, line.held, 4, "qty");
+    if (money.cmp(outstanding, "0") <= 0) {
+      results.push({ sku: line.sku, reserved: "0.0000", backordered: "0.0000",
+                     note: "already held" });
       continue;
     }
     // Partial reservation is deliberate: reserve what exists, backorder the
     // rest, rather than refusing the whole order because one line is short.
-    const take = Math.min(outstanding, Number(line.available));
-    if (take > 0) {
+    const available = money.cmp(line.available, "0") > 0
+      ? money.at(line.available, 4, "available") : "0.0000";
+    const take = money.cmp(outstanding, available) <= 0 ? outstanding : available;
+    if (money.cmp(take, "0") > 0) {
       await tx.query(
         `INSERT INTO stock_reservations
            (sales_order_line_id, product_id, warehouse_id, qty, expires_at)
          VALUES ($1, $2, $3, $4, now() + ($5 || ' minutes')::interval)`,
-        [line.id, line.product_id, line.warehouse_id, take.toFixed(4), String(ttlMinutes)]);
+        [line.id, line.product_id, line.warehouse_id, take, String(ttlMinutes)]);
     }
     results.push({
       sku: line.sku,
-      reserved: take.toFixed(4),
-      backordered: (outstanding - take).toFixed(4),
+      reserved: take,
+      backordered: money.sub(outstanding, take, 4, "qty"),
     });
   }
 
-  await tx.query(`UPDATE sales_orders SET status = 'CONFIRMED' WHERE id = $1 AND status = 'DRAFT'`,
-    [soId]);
-  void actorId;
-  return { sales_order_id: soId, status: "CONFIRMED", lines: results };
+  // Record who committed the stock. This is the one privileged act on a sales
+  // order and it previously left no trace.
+  await tx.query(
+    `UPDATE sales_orders
+        SET status = 'CONFIRMED', confirmed_by = $2, confirmed_at = now()
+      WHERE id = $1 AND status = 'DRAFT'`, [soId, actorId]);
+  return { sales_order_id: soId, status: "CONFIRMED", confirmed_by: actorId, lines: results };
 }
 
 /**
@@ -151,7 +160,7 @@ export async function fulfilSalesOrder(tx: Tx, soId: number, actorId: number) {
       WHERE l.so_id = $1 ORDER BY l.product_id, l.warehouse_id`, [soId]);
 
   const cogsLines = []; const shipped = [];
-  let cogsTotal = 0; let revenueTotal = 0;
+  const cogsAmounts: string[] = []; const revenueAmounts: string[] = [];
 
   for (const line of lines.rows) {
     // Consume conditionally in one statement. Never read-then-act: the expiry
@@ -167,14 +176,14 @@ export async function fulfilSalesOrder(tx: Tx, soId: number, actorId: number) {
       `SELECT avg_unit_cost::text FROM stock_balances
         WHERE product_id = $1 AND warehouse_id = $2`, [line.product_id, line.warehouse_id]);
     const avgCost = balance.rows[0]?.avg_unit_cost ?? "0";
-    const value = (Number(taken) * Number(avgCost)).toFixed(2);
+    const value = money.mul(taken, avgCost, 2, "avg_unit_cost");
 
     cogsLines.push({
-      account: "1300", amount: (-Number(value)).toFixed(2),
+      account: "1300", amount: money.neg(value),
       productId: Number(line.product_id), warehouseId: Number(line.warehouse_id),
     });
-    cogsTotal += Number(value);
-    revenueTotal += Number((Number(taken) * Number(line.unit_price)).toFixed(2));
+    cogsAmounts.push(value);
+    revenueAmounts.push(money.mul(taken, line.unit_price, 2, "unit_price"));
     shipped.push({ sku: line.sku, shipped: taken, unit_cost: avgCost, cogs: value });
   }
 
@@ -186,14 +195,14 @@ export async function fulfilSalesOrder(tx: Tx, soId: number, actorId: number) {
   const cogsEntry = await postEntry(tx, {
     sourceDoc: "fulfilment", sourceDocId: soId, memo: `COGS for SO ${soId}`,
     createdBy: actorId,
-    lines: [...cogsLines, { account: "5000", amount: cogsTotal.toFixed(2) }],
+    lines: [...cogsLines, { account: "5000", amount: money.sum(cogsAmounts) }],
   });
   const revenueEntry = await postEntry(tx, {
     sourceDoc: "fulfilment", sourceDocId: soId, memo: `Revenue for SO ${soId}`,
     createdBy: actorId,
     lines: [
-      { account: "1200", amount: revenueTotal.toFixed(2) },
-      { account: "4000", amount: (-revenueTotal).toFixed(2) },
+      { account: "1200", amount: money.sum(revenueAmounts) },
+      { account: "4000", amount: money.neg(money.sum(revenueAmounts)) },
     ],
   });
 
@@ -207,7 +216,7 @@ export async function fulfilSalesOrder(tx: Tx, soId: number, actorId: number) {
          (product_id, warehouse_id, qty_delta, unit_cost, movement_type,
           source_doc, source_doc_id, ledger_entry_id, created_by)
        VALUES ($1, $2, $3, $4, 'SALES_ISSUE', 'fulfilment', $5, $6, $7)`,
-      [line.product_id, line.warehouse_id, (-Number(s.shipped)).toFixed(4),
+      [line.product_id, line.warehouse_id, money.neg(s.shipped, 4, "shipped"),
        s.unit_cost, soId, cogsEntry, actorId]);
     await tx.query(
       `UPDATE sales_order_lines SET fulfilled_qty = fulfilled_qty + $2 WHERE id = $1`,
@@ -224,7 +233,7 @@ export async function fulfilSalesOrder(tx: Tx, soId: number, actorId: number) {
   return {
     sales_order_id: soId, status,
     cogs_entry_id: cogsEntry, revenue_entry_id: revenueEntry,
-    cogs_total: cogsTotal.toFixed(2), revenue_total: revenueTotal.toFixed(2),
+    cogs_total: money.sum(cogsAmounts), revenue_total: money.sum(revenueAmounts),
     lines: shipped,
   };
 }
