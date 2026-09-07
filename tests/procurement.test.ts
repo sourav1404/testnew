@@ -94,6 +94,18 @@ describe("outstanding quantity across partial receipts", () => {
     assert.equal(ok.length, 1, "exactly one receipt is accepted");
     assert.equal(rejected.length, 1);
     assert.equal(s.lines[0].received_qty, "6.0000");
+
+    // The rejection must come from the service's own pre-check under the row
+    // lock, which reports the arithmetic. If the lock is removed both callers
+    // read a stale received total, sail past the pre-check, and the second one
+    // is caught by the check_over_receipt trigger instead -- same 422, but with
+    // no detail. Asserting the detail is what makes this test able to tell the
+    // two apart, and a mutation run showed it could not before this assertion.
+    const body = rejected[0]!.body;
+    assert.equal(body.error, "over_receipt");
+    assert.equal(body.ordered, "10.0000", "the service pre-check reports what was ordered");
+    assert.equal(body.already_received, "6.0000", "and what it saw already received");
+    assert.equal(body.attempted, "6");
   });
 
   it("a goods receipt raises stock and posts a balanced GR-IR entry", async () => {
