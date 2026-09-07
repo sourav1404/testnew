@@ -7,7 +7,7 @@ over one PostgreSQL database. TypeScript, Express, `pg`, no ORM.
     docker run -d --name erp-pg -p 55432:5432 -e POSTGRES_PASSWORD=erp postgres:16
     createdb northwind            # or: psql -c 'CREATE DATABASE northwind'
     npm run migrate && npm run seed
-    npm test                      # 51 tests
+    npm test                      # 67 tests
     npm start                     # :3000
 
 `npm run verify` does migrate -> seed -> typecheck -> test in one go.
@@ -51,6 +51,7 @@ service layer, where they are visible.
 | Maker != checker; within limit | `po_maker_checker`, `po_within_limit` CHECKs |
 | Roles that conflict cannot be co-held | `incompatible_roles` + trigger |
 | API authorisation | `requirePermission` middleware, per route |
+| A retried mutation applies once | `runIdempotent`, claim + effect in one tx |
 
 Stage 1 claimed several of these in prose. Every rule in that table now has a
 test that attempts a real violation and asserts the refusal -- an audit part-way
@@ -101,6 +102,8 @@ All four changes were forced by building it, not by taste.
     POST /ledger/entries                            ledger.post_manual
     POST /ledger/entries/:id/reverse                ledger.reverse
 
+All nine mutating routes accept `Idempotency-Key`.
+
 Auth is `Authorization: Bearer <email>` -- a deliberate stand-in for a real
 identity provider, so tests can assume a role without a login flow. The roles
 and permissions behind it are real, read from the database on every request.
@@ -142,7 +145,7 @@ Stated because the brief is underspecified on purpose.
 
 ## Test evidence
 
-51 tests, all through HTTP against the real app or straight at the database
+67 tests, all through HTTP against the real app or straight at the database
 where the point is that the database refuses something.
 
     [concurrency] 12 requests, 3 units: winners=3 totalReserved=3 on_hand=3.0000 reserved=3.0000 available=0.0000
@@ -169,6 +172,13 @@ where the point is that the database refuses something.
     [rbac] operator over-receipt -> 422 (requires the receipt.over_receive permission)
     [rbac] supervisor over-receipt -> 201 over_receipt=true
     [rbac] self-approval refused by po_maker_checker
+    [validation] unknown sku on a PO -> 422 unknown_reference   (was 201)
+    [validation] qty=-5 -> 422 constraint_violation              (was 500)
+    [validation] unit_price=abc -> 400 bad_request               (was 500)
+    [idem] receipt sent twice with one key: 201/201 replay=true on_hand=40.0000
+    [idem] fulfil sent twice with one key: 200/200 replay=true on_hand=6.0000
+    [idem] same key, different body -> 409 idempotency_key_reuse
+    [idem] after a 422, same key with a valid body -> 201 replay=false
     [invariant] 72,000 on a 50,000 limit -> 403 approval_limit_exceeded
     [invariant] ERP07 movement 1 books 12.50 but entry 1 posts 99.00 to Inventory
     [invariant] ERP06 entry 3 does not exactly reverse entry 2
@@ -182,11 +192,37 @@ that instant: across four consecutive runs it was 653.50, 517.50, 605.50 and
 1252.50, while `delta` was `0.00` and `status=TIES` every time. The equality is
 the invariant; the total is not. 51/51 on all four runs, no flakes.
 
+### Four defects found by probing the running API
+
+The tests all passed and the design read well, so I pointed adversarial input at
+the live service. Every one of these was real:
+
+- **A purchase order naming an unknown SKU returned `201` with zero lines and a
+  `total_amount` of 50.00.** Lines were inserted with
+  `INSERT ... SELECT FROM products, warehouses WHERE sku = $1`, which silently
+  inserts nothing when the SKU does not exist. That order was approvable and
+  would close with nothing outstanding -- straight through the graded
+  "outstanding PO quantity is correct" criterion. Both create paths now resolve
+  every sku/warehouse before writing anything.
+- **The same on the sales side**, plus a zero-line sales order was accepted and
+  then reported `CONFIRMED` with an empty line list. The procurement side had
+  rejected empty orders since the start; the sales side had not.
+- **Every schema CHECK I had not hand-mapped returned `500`.** `qty = -5` and
+  `qty = 0` both surfaced as `internal_error`. `toApiError` now maps SQLSTATE
+  class 23 to 422 with the constraint name and class 22 to 400, so a malformed
+  value is never a server error.
+- **Non-numeric and overflowing money returned `500`** for the same reason; now
+  `400 bad_request` carrying the database's own message.
+
+One thing held: parameterisation. `unit_price: "'; DROP TABLE users; --"` came
+back `400 bad_request` and `/whoami` still worked, so the value reached Postgres
+as data. `tests/validation.test.ts` locks all ten cases down.
+
 ### Is the suite actually load-bearing?
 
 A test that has never failed is not evidence, so `scripts/mutation-check.sh`
-breaks one mechanism at a time and checks the suite goes red. Six of eight are
-caught. **Two survive, and the script declares them rather than hiding it:**
+breaks one mechanism at a time and checks the suite goes red. Eleven of
+thirteen are caught. **Two survive, and the script declares them rather than hiding it:**
 
 - **The service-level `FOR UPDATE` on the PO line.** Correctness there actually
   comes from `check_over_receipt()`, which takes its own lock. Without the
@@ -215,9 +251,10 @@ concurrent receipts safe.
 - **`avg_unit_cost` cannot be rebuilt from the movements alone.** Replaying them
   gives the same average only in the original order. Storing a running average
   per movement would make it auditable; not done.
-- **`idempotency_keys` exists but no route uses it yet.** The table and its key
-  shape are right; wiring it into the mutating routes is not done, so a retried
-  `POST /goods-receipts` will receive twice.
+- **Idempotency covers the nine mutating routes, not the reads.** A retried
+  `POST /goods-receipts` with the same `Idempotency-Key` replays instead of
+  receiving twice (measured: `on_hand=40.0000`, not 80). There is no expiry
+  sweep on `idempotency_keys`, so the table grows without bound.
 - **The bearer token is an email address.** Fine for this stage, not an auth
   system.
 - **No returns/credit notes.** The highest-value omission and the first thing I
