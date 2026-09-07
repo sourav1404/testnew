@@ -196,9 +196,9 @@ where the point is that the database refuses something.
 
 The reconciliation *total* is deliberately not quoted. `node:test` runs the
 files concurrently, so the figure depends on which other tests have committed at
-that instant: across four consecutive runs it was 653.50, 517.50, 605.50 and
-1252.50, while `delta` was `0.00` and `status=TIES` every time. The equality is
-the invariant; the total is not. 51/51 on all four runs, no flakes.
+that instant: across four consecutive runs it was 841.50, 745.50, 703.71 and
+833.50, while `delta` was `0.00` and `status=TIES` every time. The equality is
+the invariant; the total is not. 83/83 on all four runs, no flakes.
 
 ### Four defects found by probing the running API
 
