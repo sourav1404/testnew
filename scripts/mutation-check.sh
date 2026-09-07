@@ -99,8 +99,8 @@ mutate "reservation row lock removed" src/modules/sales.ts \
   tests/concurrency.test.ts
 
 mutate "reservation ignores availability" src/modules/sales.ts \
-  "const take = Math.min(outstanding, Number(line.available));" \
-  "const take = outstanding;" \
+  "    const take = money.cmp(outstanding, available) <= 0 ? outstanding : available;" \
+  "    const take = outstanding;" \
   tests/concurrency.test.ts
 
 mutate "over-receipt check disabled" src/modules/procurement.ts \
