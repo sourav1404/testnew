@@ -1,0 +1,218 @@
+import type { Tx } from "../db.js";
+import { ApiError } from "../errors.js";
+import { postEntry } from "./ledger.js";
+
+export interface PoLineInput { sku: string; warehouse: string; qty: string; unitPrice: string }
+
+export async function createPurchaseOrder(
+  tx: Tx, input: { poNumber: string; supplierCode: string; lines: PoLineInput[]; actorId: number },
+) {
+  if (input.lines.length === 0) {
+    throw new ApiError(422, "empty_order", "a purchase order needs at least one line");
+  }
+  const supplier = await tx.query<{ id: string }>(
+    `SELECT id FROM suppliers WHERE code = $1 AND is_active`, [input.supplierCode]);
+  if (!supplier.rows[0]) {
+    throw new ApiError(422, "unknown_reference", `unknown supplier ${input.supplierCode}`);
+  }
+
+  const total = input.lines
+    .reduce((s, l) => s + Number(l.qty) * Number(l.unitPrice), 0).toFixed(2);
+
+  const po = await tx.query<{ id: string }>(
+    `INSERT INTO purchase_orders (po_number, supplier_id, status, total_amount, created_by)
+     VALUES ($1, $2, 'PENDING_APPROVAL', $3, $4) RETURNING id`,
+    [input.poNumber, supplier.rows[0].id, total, input.actorId]);
+  const poId = Number(po.rows[0]!.id);
+
+  for (const line of input.lines) {
+    await tx.query(
+      `INSERT INTO purchase_order_lines (po_id, product_id, warehouse_id, ordered_qty, unit_price)
+       SELECT $1, p.id, w.id, $4, $5 FROM products p, warehouses w
+        WHERE p.sku = $2 AND w.code = $3`,
+      [poId, line.sku, line.warehouse, line.qty, line.unitPrice]);
+  }
+  return { purchase_order_id: poId, status: "PENDING_APPROVAL", total_amount: total };
+}
+
+/**
+ * Approval snapshots the approver's limit onto the PO. po_maker_checker and
+ * po_within_limit are CHECK constraints, so a service bug cannot approve your
+ * own order or exceed your limit -- the write simply fails and the error mapper
+ * turns it into a 403.
+ */
+export async function approvePurchaseOrder(tx: Tx, poId: number, actorId: number) {
+  const limit = await tx.query<{ lim: string | null }>(
+    `SELECT max(r.po_approval_limit)::text AS lim
+       FROM user_roles ur JOIN roles r ON r.code = ur.role_code
+      WHERE ur.user_id = $1`, [actorId]);
+
+  const { rows } = await tx.query<{ id: string; status: string; approved_limit: string }>(
+    `UPDATE purchase_orders
+        SET status = 'APPROVED', approved_by = $2, approved_at = now(), approved_limit = $3
+      WHERE id = $1 AND status = 'PENDING_APPROVAL'
+      RETURNING id, status, approved_limit::text`,
+    [poId, actorId, limit.rows[0]?.lim ?? null]);
+
+  if (!rows[0]) {
+    throw new ApiError(409, "not_pending_approval",
+      `purchase order ${poId} is not awaiting approval`);
+  }
+  return { purchase_order_id: rows[0].id, status: rows[0].status, approved_limit: rows[0].approved_limit };
+}
+
+export async function purchaseOrderStatus(tx: Tx, poId: number) {
+  const po = await tx.query(
+    `SELECT po.id::text, po.po_number, po.status, po.total_amount::text,
+            po.created_by::text, po.approved_by::text, po.approved_at
+       FROM purchase_orders po WHERE po.id = $1`, [poId]);
+  if (!po.rows[0]) throw new ApiError(404, "not_found", `purchase order ${poId} not found`);
+
+  const lines = await tx.query(
+    `SELECT s.po_line_id::text, p.sku, w.code AS warehouse,
+            s.ordered_qty::text, s.received_qty::text, s.outstanding_qty::text,
+            s.is_over_received, s.unit_price::text
+       FROM po_line_status s
+       JOIN products p   ON p.id = s.product_id
+       JOIN warehouses w ON w.id = s.warehouse_id
+      WHERE s.po_id = $1 ORDER BY s.po_line_id`, [poId]);
+
+  return { ...po.rows[0], lines: lines.rows };
+}
+
+export interface ReceiptLineInput {
+  poLineId: number;
+  receivedQty: string;
+  /** Caller must ask for it AND hold receipt.over_receive; neither alone is enough. */
+  allowOverReceipt?: boolean;
+}
+
+/**
+ * Requirement 4. Over-receipt is decided here, in application code, under an
+ * explicit row lock -- not left to the trigger, which stays as the backstop.
+ *
+ * Partial receipt needs no special case: outstanding_qty is derived from the
+ * sum of receipts (po_line_status), so receiving 40 of 100 leaves 60
+ * outstanding without any counter to keep in step.
+ */
+export async function receiveGoods(
+  tx: Tx,
+  input: { poId: number; lines: ReceiptLineInput[]; actorId: number; mayOverReceive: boolean },
+) {
+  const po = await tx.query<{ status: string }>(
+    `SELECT status FROM purchase_orders WHERE id = $1`, [input.poId]);
+  if (!po.rows[0]) throw new ApiError(404, "not_found", `purchase order ${input.poId} not found`);
+  if (!["APPROVED", "RECEIVING"].includes(po.rows[0].status)) {
+    throw new ApiError(409, "not_receivable",
+      `purchase order ${input.poId} is ${po.rows[0].status}; only an approved PO can be received`);
+  }
+
+  // Lock every PO line this receipt touches, in id order, in one statement.
+  // LockRows sits above Sort, so two concurrent receipts over the same lines
+  // queue rather than deadlock -- and neither can read a stale received total.
+  const ids = input.lines.map((l) => l.poLineId).sort((a, b) => a - b);
+  const locked = await tx.query<{
+    id: string; product_id: string; warehouse_id: string;
+    ordered_qty: string; unit_price: string; received: string;
+  }>(
+    `SELECT l.id, l.product_id, l.warehouse_id, l.ordered_qty::text, l.unit_price::text,
+            COALESCE((SELECT SUM(g.received_qty) FROM goods_receipt_lines g
+                       WHERE g.po_line_id = l.id), 0)::text AS received
+       FROM purchase_order_lines l
+      WHERE l.id = ANY($1::bigint[]) AND l.po_id = $2
+      ORDER BY l.id
+      FOR UPDATE OF l`, [ids, input.poId]);
+
+  if (locked.rowCount !== ids.length) {
+    throw new ApiError(422, "unknown_reference", "one or more PO lines do not belong to this PO");
+  }
+  const byId = new Map(locked.rows.map((r) => [Number(r.id), r]));
+
+  // Decide over-receipt for every line before writing anything, so the response
+  // is one verdict for the whole receipt rather than a half-applied batch.
+  const planned = input.lines.map((line) => {
+    const po_line = byId.get(line.poLineId)!;
+    const after = Number(po_line.received) + Number(line.receivedQty);
+    const isOver = after > Number(po_line.ordered_qty);
+    if (isOver && !(line.allowOverReceipt && input.mayOverReceive)) {
+      throw new ApiError(422, "over_receipt",
+        `over-receipt on PO line ${line.poLineId}`, {
+          po_line_id: line.poLineId,
+          ordered: po_line.ordered_qty,
+          already_received: po_line.received,
+          attempted: line.receivedQty,
+          hint: line.allowOverReceipt
+            ? "requires the receipt.over_receive permission"
+            : "resubmit with allow_over_receipt to accept it as an over-receipt",
+        });
+    }
+    return { line, po_line, isOver };
+  });
+
+  const receipt = await tx.query<{ id: string }>(
+    `INSERT INTO goods_receipts (po_id, received_by) VALUES ($1, $2) RETURNING id`,
+    [input.poId, input.actorId]);
+  const receiptId = Number(receipt.rows[0]!.id);
+
+  // One journal entry for the whole receipt: DR Inventory per line, CR GR-IR
+  // for the total. The Inventory lines carry product+warehouse so the control
+  // account ties per SKU, which is what movement_ties_to_ledger checks.
+  const entryLines = planned.map(({ line, po_line }) => ({
+    account: "1300",
+    amount: (Number(line.receivedQty) * Number(po_line.unit_price)).toFixed(2),
+    productId: Number(po_line.product_id),
+    warehouseId: Number(po_line.warehouse_id),
+  }));
+  const grossValue = entryLines.reduce((s, l) => s + Number(l.amount), 0).toFixed(2);
+
+  const entryId = await postEntry(tx, {
+    sourceDoc: "goods_receipt",
+    sourceDocId: receiptId,
+    memo: `Goods receipt ${receiptId} against PO ${input.poId}`,
+    createdBy: input.actorId,
+    lines: [...entryLines, { account: "2100", amount: (-Number(grossValue)).toFixed(2) }],
+  });
+
+  const out = [];
+  for (const { line, po_line, isOver } of planned) {
+    const movement = await tx.query<{ id: string }>(
+      `INSERT INTO stock_movements
+         (product_id, warehouse_id, qty_delta, unit_cost, movement_type,
+          source_doc, source_doc_id, ledger_entry_id, created_by)
+       VALUES ($1, $2, $3, $4, 'GOODS_RECEIPT', 'goods_receipt', $5, $6, $7)
+       RETURNING id`,
+      [po_line.product_id, po_line.warehouse_id, line.receivedQty, po_line.unit_price,
+       receiptId, entryId, input.actorId]);
+
+    await tx.query(
+      `INSERT INTO goods_receipt_lines
+         (goods_receipt_id, po_line_id, received_qty, stock_movement_id, over_receipt)
+       VALUES ($1, $2, $3, $4, $5)`,
+      [receiptId, line.poLineId, line.receivedQty, movement.rows[0]!.id, isOver]);
+
+    const remaining = Number(po_line.ordered_qty)
+      - Number(po_line.received) - Number(line.receivedQty);
+    out.push({
+      po_line_id: line.poLineId,
+      received_qty: line.receivedQty,
+      outstanding_qty: remaining.toFixed(4),
+      over_receipt: isOver,
+      stock_movement_id: movement.rows[0]!.id,
+    });
+  }
+
+  // CLOSED only when nothing is outstanding anywhere on the PO.
+  const still = await tx.query<{ open: string }>(
+    `SELECT count(*)::text AS open FROM po_line_status
+      WHERE po_id = $1 AND outstanding_qty > 0`, [input.poId]);
+  await tx.query(
+    `UPDATE purchase_orders SET status = $2 WHERE id = $1`,
+    [input.poId, Number(still.rows[0]!.open) === 0 ? "CLOSED" : "RECEIVING"]);
+
+  return {
+    goods_receipt_id: receiptId,
+    ledger_entry_id: entryId,
+    gross_value: grossValue,
+    lines: out,
+  };
+}
