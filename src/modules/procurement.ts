@@ -1,5 +1,6 @@
 import type { Tx } from "../db.js";
 import { ApiError } from "../errors.js";
+import { resolveLocation } from "./inventory.js";
 import { postEntry } from "./ledger.js";
 
 export interface PoLineInput { sku: string; warehouse: string; qty: string; unitPrice: string }
@@ -16,6 +17,16 @@ export async function createPurchaseOrder(
     throw new ApiError(422, "unknown_reference", `unknown supplier ${input.supplierCode}`);
   }
 
+  // Resolve every sku/warehouse BEFORE writing anything. The first version
+  // inserted lines with `INSERT ... SELECT FROM products, warehouses WHERE
+  // sku = $1`, which silently inserts zero rows for an unknown sku -- a probe
+  // produced a 201 purchase order with no lines and a total_amount of 50.00,
+  // which would then approve and close with nothing outstanding.
+  const resolved = [];
+  for (const line of input.lines) {
+    resolved.push({ line, loc: await resolveLocation(tx, line.sku, line.warehouse) });
+  }
+
   const total = input.lines
     .reduce((s, l) => s + Number(l.qty) * Number(l.unitPrice), 0).toFixed(2);
 
@@ -25,12 +36,14 @@ export async function createPurchaseOrder(
     [input.poNumber, supplier.rows[0].id, total, input.actorId]);
   const poId = Number(po.rows[0]!.id);
 
-  for (const line of input.lines) {
-    await tx.query(
+  for (const { line, loc } of resolved) {
+    const ins = await tx.query(
       `INSERT INTO purchase_order_lines (po_id, product_id, warehouse_id, ordered_qty, unit_price)
-       SELECT $1, p.id, w.id, $4, $5 FROM products p, warehouses w
-        WHERE p.sku = $2 AND w.code = $3`,
-      [poId, line.sku, line.warehouse, line.qty, line.unitPrice]);
+       VALUES ($1, $2, $3, $4, $5)`,
+      [poId, loc.productId, loc.warehouseId, line.qty, line.unitPrice]);
+    if (ins.rowCount !== 1) {
+      throw new ApiError(500, "internal_error", "purchase order line was not written");
+    }
   }
   return { purchase_order_id: poId, status: "PENDING_APPROVAL", total_amount: total };
 }

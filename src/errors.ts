@@ -55,5 +55,19 @@ export function toApiError(err: unknown): ApiError {
   if (bySqlstate) {
     return new ApiError(bySqlstate[0], bySqlstate[1], e.message ?? "rejected");
   }
+
+  // Anything the database rejects is a client problem, not a server problem.
+  // Without this fallback every CHECK constraint I had not hand-mapped above
+  // came back as a 500 -- a probe found ordered_qty <= 0 and a non-numeric
+  // unit_price both doing exactly that. Class 23 is integrity constraint
+  // violation and class 22 is data exception, so both are the caller's fault.
+  const code = e.code ?? "";
+  if (code.startsWith("23")) {
+    return new ApiError(422, "constraint_violation",
+      e.message ?? "rejected", e.constraint ? { constraint: e.constraint } : undefined);
+  }
+  if (code.startsWith("22")) {
+    return new ApiError(400, "bad_request", e.message ?? "malformed value");
+  }
   return new ApiError(500, "internal_error", "unexpected failure");
 }

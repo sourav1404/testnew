@@ -135,9 +135,34 @@ expect_survivor "deferred constraints left until COMMIT" src/db.ts \
   tests/ledger.test.ts \
   "without it the deferred trigger fires during COMMIT instead; withTx still rolls back and the error still maps to the same 422, so no HTTP-level test can tell the difference. The line is kept because it raises the failure where a caller could still handle it, not because a test proves it"
 
+mutate "idempotency replay check removed" src/idempotency.ts \
+  "    if (claim.rowCount === 0) {" \
+  "    if (false) {" \
+  tests/idempotency.test.ts
+
+mutate "idempotency request-hash check removed" src/idempotency.ts \
+  "      if (row.request_hash !== requestHash) {" \
+  "      if (false) {" \
+  tests/idempotency.test.ts
+
+mutate "unknown sku/warehouse no longer rejected" src/modules/inventory.ts \
+  "  if (!row) throw new ApiError(422, \"unknown_reference\", \`unknown sku/warehouse \${sku}/\${warehouse}\`);" \
+  "  if (!row) return { productId: 1, warehouseId: 1 };" \
+  tests/validation.test.ts
+
+mutate "constraint errors fall through to 500 again" src/errors.ts \
+  "  if (code.startsWith(\"23\")) {" \
+  "  if (false) {" \
+  tests/validation.test.ts
+
+mutate "empty sales order accepted again" src/modules/sales.ts \
+  "  if (input.lines.length === 0) {" \
+  "  if (false) {" \
+  tests/validation.test.ts
+
 echo
 if [ "$fail" -ne 0 ]; then
   echo "RESULT: $fail mutation(s) survived or went stale -- the suite is not proving what it claims"
   exit 1
 fi
-echo "RESULT: 6 mutations caught, 2 declared unobservable and holding"
+echo "RESULT: 11 mutations caught, 2 declared unobservable and holding"

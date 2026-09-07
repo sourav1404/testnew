@@ -1,5 +1,6 @@
 import type { Tx } from "../db.js";
 import { ApiError } from "../errors.js";
+import { resolveLocation } from "./inventory.js";
 import { postEntry } from "./ledger.js";
 
 export interface SoLineInput { sku: string; warehouse: string; qty: string; unitPrice: string }
@@ -7,23 +8,39 @@ export interface SoLineInput { sku: string; warehouse: string; qty: string; unit
 export async function createSalesOrder(
   tx: Tx, input: { soNumber: string; customerCode: string; lines: SoLineInput[]; actorId: number },
 ) {
+  // Same asymmetry the procurement side had: an order with no lines is not an
+  // order. A probe confirmed a zero-line sales order was accepted and then
+  // happily reported CONFIRMED with an empty line list.
+  if (input.lines.length === 0) {
+    throw new ApiError(422, "empty_order", "a sales order needs at least one line");
+  }
   const customer = await tx.query<{ id: string }>(
     `SELECT id FROM customers WHERE code = $1 AND is_active`, [input.customerCode]);
   if (!customer.rows[0]) {
     throw new ApiError(422, "unknown_reference", `unknown customer ${input.customerCode}`);
   }
+
+  // Resolve before writing, so an unknown sku/warehouse is a 422 rather than a
+  // sales order with zero lines.
+  const resolved = [];
+  for (const line of input.lines) {
+    resolved.push({ line, loc: await resolveLocation(tx, line.sku, line.warehouse) });
+  }
+
   const so = await tx.query<{ id: string }>(
     `INSERT INTO sales_orders (so_number, customer_id, created_by)
      VALUES ($1, $2, $3) RETURNING id`,
     [input.soNumber, customer.rows[0].id, input.actorId]);
   const soId = Number(so.rows[0]!.id);
 
-  for (const line of input.lines) {
-    await tx.query(
+  for (const { line, loc } of resolved) {
+    const ins = await tx.query(
       `INSERT INTO sales_order_lines (so_id, product_id, warehouse_id, qty, unit_price)
-       SELECT $1, p.id, w.id, $4, $5 FROM products p, warehouses w
-        WHERE p.sku = $2 AND w.code = $3`,
-      [soId, line.sku, line.warehouse, line.qty, line.unitPrice]);
+       VALUES ($1, $2, $3, $4, $5)`,
+      [soId, loc.productId, loc.warehouseId, line.qty, line.unitPrice]);
+    if (ins.rowCount !== 1) {
+      throw new ApiError(500, "internal_error", "sales order line was not written");
+    }
   }
   return { sales_order_id: soId, status: "DRAFT" };
 }
