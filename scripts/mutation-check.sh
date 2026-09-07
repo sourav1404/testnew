@@ -160,9 +160,34 @@ mutate "empty sales order accepted again" src/modules/sales.ts \
   "  if (false) {" \
   tests/validation.test.ts
 
+mutate "money arithmetic back to float" src/money.ts \
+  "    return unscale(scaled(a, field) * scaled(b, field) / WORK_SCALE, dp);" \
+  "    return (Number(a) * Number(b)).toFixed(dp);" \
+  tests/precision.test.ts
+
+mutate "idempotency hash no longer canonical" src/idempotency.ts \
+  "  if (Array.isArray(v)) return \`[\${v.map(canonical).join(\",\")}]\`;" \
+  "  return JSON.stringify(v);" \
+  tests/idempotency.test.ts
+
+mutate "abandoned-claim reclaim removed" src/idempotency.ts \
+  "        WHERE idempotency_keys.response_code = 0" \
+  "        WHERE false AND idempotency_keys.response_code = 0" \
+  tests/idempotency.test.ts
+
+mutate "confirmation actor no longer recorded" src/modules/sales.ts \
+  "        SET status = 'CONFIRMED', confirmed_by = \$2, confirmed_at = now()" \
+  "        SET status = 'CONFIRMED', confirmed_by = created_by, confirmed_at = now()" \
+  tests/precision.test.ts
+
+mutate "idempotency key purge disabled" src/idempotency.ts \
+  "    \`DELETE FROM idempotency_keys WHERE created_at < now() - \$1::interval\`," \
+  "    \`SELECT 1 WHERE created_at IS NULL AND \$1::interval IS NOT NULL\`," \
+  tests/idempotency.test.ts
+
 echo
 if [ "$fail" -ne 0 ]; then
   echo "RESULT: $fail mutation(s) survived or went stale -- the suite is not proving what it claims"
   exit 1
 fi
-echo "RESULT: 11 mutations caught, 2 declared unobservable and holding"
+echo "RESULT: 16 mutations caught, 2 declared unobservable and holding"
